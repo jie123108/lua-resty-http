@@ -197,6 +197,75 @@ local function _should_receive_body(method, code)
 end
 
 
+-----------------------------------------------------------------------------
+-- Parses a url and returns a table with all its parts according to RFC 2396
+-- The following grammar describes the names given to the URL parts
+-- <url> ::= <scheme>://<authority>/<path>;<params>?<query>#<fragment>
+-- <authority> ::= <userinfo>@<host>:<port>
+-- <userinfo> ::= <user>[:<password>]
+-- <path> :: = {<segment>/}<segment>
+-- Input
+--   url: uniform resource locator of request
+--   default: table with default values for each field
+-- Returns
+--   table with the following fields, where RFC naming conventions have
+--   been preserved:
+--     scheme, authority, userinfo, user, password, host, port,
+--     path, params, query, fragment
+-- Obs:
+--   the leading '/' in {/<path>} is considered part of <path>
+-----------------------------------------------------------------------------
+function _M.parse(url, default)
+    -- initialize default parameters
+    local parsed = {}
+    for i,v in pairs(default or parsed) do parsed[i] = v end
+    -- empty url is parsed to nil
+    if not url or url == "" then return nil, "invalid url" end
+    -- remove whitespace
+    -- url = string.gsub(url, "%s", "")
+    -- get fragment
+    url = string.gsub(url, "#(.*)$", function(f)
+        parsed.fragment = f
+        return ""
+    end)
+    -- get scheme
+    url = string.gsub(url, "^([%w][%w%+%-%.]*)%:",
+        function(s) parsed.scheme = s; return "" end)
+    -- get authority
+    url = string.gsub(url, "^//([^/]*)", function(n)
+        parsed.authority = n
+        return ""
+    end)
+    -- get query string
+    url = string.gsub(url, "%?(.*)", function(q)
+        parsed.query = q
+        return ""
+    end)
+    -- get params
+    url = string.gsub(url, "%;(.*)", function(p)
+        parsed.params = p
+        return ""
+    end)
+    -- path is whatever was left
+    if url ~= "" then parsed.path = url end
+    local authority = parsed.authority
+    if not authority then return parsed end
+    authority = string.gsub(authority,"^([^@]*)@",
+        function(u) parsed.userinfo = u; return "" end)
+    authority = string.gsub(authority, ":([^:%]]*)$",
+        function(p) parsed.port = p; return "" end)
+    if authority ~= "" then 
+        -- IPv6?
+        parsed.host = string.match(authority, "^%[(.+)%]$") or authority 
+    end
+    local userinfo = parsed.userinfo
+    if not userinfo then return parsed end
+    userinfo = string.gsub(userinfo, ":([^:]*)$",
+        function(p) parsed.password = p; return "" end)
+    parsed.user = userinfo
+    return parsed
+end
+
 function _M.parse_uri(self, uri)
     local m, err = ngx_re_match(uri, [[^(http[s]?)://([^:/]+)(?::(\d+))?(.*)]],
         "jo")
@@ -745,8 +814,30 @@ function _M.request_uri(self, uri, params)
     end
 
     local scheme, host, port, path = unpack(parsed_uri)
-    if not params.path then params.path = path end
+    
+    if params and params.proxy then 
+        local default = {
+            host = "",
+            port = 3128,
+            scheme = "http"
+        }
+        local proxy = _M.parse(params.proxy, default)
+        -- if there is a proxy, we need the full url. otherwise, just a part.    
+        path = scheme .. "://" .. host .. ":" .. tostring(port) .. path
+        -- scheme = proxy.scheme or scheme
+        host = proxy.host
+        port = proxy.port 
+        local headers = params.headers or {}
+        local connection = headers["Connection"]
+        headers["Connection"] = nil 
+        headers["Proxy-Connection"] = connection 
+        if proxy.user and proxy.password then
+            headers["proxy-authorization"] =
+                "Basic " ..  (ngx.encode_base64(proxy.user .. ":" .. proxy.password))
+        end
+    end
 
+    if not params.path then params.path = path end
     local c, err = self:connect(host, port)
     if not c then
         return nil, err
@@ -765,11 +856,19 @@ function _M.request_uri(self, uri, params)
 
     local res, err = self:request(params)
     if not res then
+        local ok, err_close = self:close()
+        if not ok then
+            ngx_log(ngx_ERR, err_close)
+        end
         return nil, err
     end
 
     local body, err = res:read_body()
     if not body then
+        local ok, err_close = self:close()
+        if not ok then
+            ngx_log(ngx_ERR, err_close)
+        end
         return nil, err
     end
 
@@ -778,6 +877,8 @@ function _M.request_uri(self, uri, params)
     local ok, err = self:set_keepalive()
     if not ok then
         ngx_log(ngx_ERR, err)
+        self:close()
+        return nil, err
     end
 
     return res, nil
