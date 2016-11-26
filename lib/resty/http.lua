@@ -1,5 +1,5 @@
 local http_headers = require "resty.http_headers"
-
+local cjson = require("cjson")
 local ngx_socket_tcp = ngx.socket.tcp
 local ngx_req = ngx.req
 local ngx_req_socket = ngx_req.socket
@@ -807,78 +807,113 @@ end
 
 function _M.request_uri(self, uri, params)
     if not params then params = {} end
-
     local parsed_uri, err = self:parse_uri(uri)
     if not parsed_uri then
         return nil, err
     end
 
-    local scheme, host, port, path = unpack(parsed_uri)
-    
+    local target_scheme, target_host, target_port, target_path = unpack(parsed_uri)
+    local scheme, host, port, path = target_scheme, target_host, target_port, target_path
+    local proxy = nil
+   
     if params and params.proxy then 
         local default = {
             host = "",
             port = 3128,
             scheme = "http"
         }
-        local proxy = _M.parse(params.proxy, default)
-        -- if there is a proxy, we need the full url. otherwise, just a part.    
-        path = scheme .. "://" .. host .. ":" .. tostring(port) .. path
-        -- scheme = proxy.scheme or scheme
+        proxy = _M.parse(params.proxy, default)
         host = proxy.host
-        port = proxy.port 
-        local headers = params.headers or {}
-        local connection = headers["Connection"]
-        headers["Connection"] = nil 
-        headers["Proxy-Connection"] = connection 
-        if proxy.user and proxy.password then
-            headers["proxy-authorization"] =
-                "Basic " ..  (ngx.encode_base64(proxy.user .. ":" .. proxy.password))
+        port = proxy.port
+        scheme = proxy.scheme
+
+        if target_scheme == "http" then 
+            path = target_scheme .. "://" .. target_host .. ":" .. tostring(target_port) .. (target_path or "")
+            local headers = params.headers or {}
+            local connection = headers["Connection"]
+            headers["Connection"] = nil 
+            headers["Proxy-Connection"] = connection
+            if proxy.user and proxy.password then
+                headers["proxy-authorization"] = "Basic " ..  (ngx.encode_base64(proxy.user .. ":" .. proxy.password))
+            end
+            params.headers = headers
         end
     end
 
     if not params.path then params.path = path end
+
     local c, err = self:connect(host, port)
     if not c then
         return nil, err
     end
 
-    if scheme == "https" then
+    if proxy and target_scheme == "https" then 
+        local proxy_params = {}
+        proxy_params.version = params.version 
+        proxy_params.method = "CONNECT"
+        proxy_params.path = target_host .. ":" .. tostring(target_port)
+        proxy_params.ssl_verify = false
+        proxy_params.headers = {}
+        if params.headers then 
+            for k, v in pairs(params.headers) do 
+                proxy_params.headers[k] = v
+            end
+        end
+        if proxy.user and proxy.password then
+            proxy_params.headers["proxy-authorization"] = "Basic " ..  (ngx.encode_base64(proxy.user .. ":" .. proxy.password))
+        end
+        proxy_params.headers["Host"] = target_host .. ":" .. tostring(target_port)
+
+        local res, err = self:request(proxy_params)
+        if not res then 
+            self:close()
+            return nil, err
+        end
+
+        if res.status ~= 200 then 
+            ngx.log(ngx.ERR, "CONNECT res.status: ", tostring(res.status), ", res.headers[", cjson.encode(res.headers), "]")
+            self:close()
+            return nil, "CONNECT Failed! status:" .. tostring(res.status)
+        end
+        
+    end
+
+    if target_scheme == "https" then
         local verify = true
         if params.ssl_verify == false then
             verify = false
         end
-        local ok, err = self:ssl_handshake(nil, host, verify)
+        local ok, err = self:ssl_handshake(nil, target_host, verify)
         if not ok then
             return nil, err
         end
     end
 
+    if params.headers then 
+        params.headers["Host"] = target_host
+    end    
     local res, err = self:request(params)
     if not res then
-        local ok, err_close = self:close()
-        if not ok then
-            ngx_log(ngx_ERR, err_close)
-        end
-        return nil, err
-    end
-
-    local body, err = res:read_body()
-    if not body then
-        local ok, err_close = self:close()
-        if not ok then
-            ngx_log(ngx_ERR, err_close)
-        end
-        return nil, err
-    end
-
-    res.body = body
-
-    local ok, err = self:set_keepalive()
-    if not ok then
-        ngx_log(ngx_ERR, err)
         self:close()
         return nil, err
+    end
+
+    local body, err = res:read_body()    
+    if not body then
+        self:close()
+        return nil, err
+    end
+    res.body = body
+
+    if proxy and target_scheme == "https" then 
+        self:close()
+    else
+        local ok, err = self:set_keepalive()
+        if not ok then
+            ngx_log(ngx_ERR, err)
+            self:close()
+            return nil, err
+        end
     end
 
     return res, nil

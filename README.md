@@ -63,7 +63,8 @@ server {
         body = "a=1&b=2",
         headers = {
           ["Content-Type"] = "application/x-www-form-urlencoded",
-        }
+        },
+		proxy = "http://proxyuser:proxypwd@proxyaddress:3128",
       })
 
       if not res then
@@ -233,7 +234,9 @@ When the request is successful, `res` will contain the following fields:
 
 `syntax: res, err = httpc:request_uri(uri, params)`
 
-The simple interface. Options supplied in the `params` table are the same as in the generic interface, and will override components found in the uri itself.
+The simple interface. Options supplied in the `params` table are the same as in the generic interface(add a `proxy` param), and will override components found in the uri itself.
+
+* `proxy` The http proxy url. 
 
 In this mode, there is no need to connect manually first. The connection is made on your behalf, suiting cases where you simply need to grab a URI without too much hassle.
 
